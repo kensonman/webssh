@@ -1,3 +1,4 @@
+import io
 import unittest
 import paramiko
 
@@ -5,8 +6,9 @@ from tornado.httputil import HTTPServerRequest
 from tornado.options import options
 from tests.utils import read_file, make_tests_data_path
 from webssh import handler
+from webssh import worker
 from webssh.handler import (
-    MixinHandler, WsockHandler, PrivateKey, InvalidValueError
+    IndexHandler, MixinHandler, WsockHandler, PrivateKey, InvalidValueError, SSHClient
 )
 
 try:
@@ -277,3 +279,62 @@ class TestWsockHandler(unittest.TestCase):
         obj.origin_policy = '*'
         origin = 'https://blog.example.org'
         self.assertTrue(WsockHandler.check_origin(obj, origin))
+
+    def test_failed_weak_ref(self):
+        request = HTTPServerRequest(uri='/')
+        obj = Mock(spec=WsockHandler, request=request)
+        obj.src_addr = ("127.0.0.1", 8888)
+
+        class FakeWeakRef:
+            def __init__(self):
+                self.count = 0
+
+            def __call__(self):
+                self.count += 1
+                return None
+
+        ref = FakeWeakRef()
+        obj.worker_ref = ref
+        WsockHandler.on_message(obj, b'{"data": "somestuff"}')
+        self.assertGreaterEqual(ref.count, 1)
+        obj.close.assert_called_with(reason='No worker found')
+
+    def test_worker_closed(self):
+        request = HTTPServerRequest(uri='/')
+        obj = Mock(spec=WsockHandler, request=request)
+        obj.src_addr = ("127.0.0.1", 8888)
+
+        class Worker:
+            def __init__(self):
+                self.closed = True
+
+        class FakeWeakRef:
+            def __call__(self):
+                return Worker()
+
+        ref = FakeWeakRef()
+        obj.worker_ref = ref
+        WsockHandler.on_message(obj, b'{"data": "somestuff"}')
+        obj.close.assert_called_with(reason='Worker closed')
+
+class TestIndexHandler(unittest.TestCase):
+    def test_null_in_encoding(self):
+        handler = Mock(spec=IndexHandler)
+
+        # This is a little nasty, but the index handler has a lot of
+        # dependencies to mock. Mocking out everything but the bits
+        # we want to test lets us test this case without needing to
+        # refactor the relevant code out of IndexHandler
+        def parse_encoding(data):
+            return IndexHandler.parse_encoding(handler, data)
+        handler.parse_encoding = parse_encoding
+
+        ssh = Mock(spec=SSHClient)
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(initial_bytes=b"UTF-8\0")
+        stderr = io.BytesIO()
+        ssh.exec_command.return_value = (stdin, stdout, stderr)
+
+        encoding = IndexHandler.get_default_encoding(handler, ssh)
+        self.assertEquals("utf-8", encoding)
+
